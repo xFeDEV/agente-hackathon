@@ -9,8 +9,17 @@ services:
       - "8000:8000"
     volumes:
       - ./backend/app:/app
+      # Montar la llave de servicio de Google Cloud (solo lectura)
+      - ./config/primeval-falcon-474622-h1-d5121477addc.json:/app/config/gcloud-key.json:ro
     environment:
       - DATABASE_URL=postgresql+asyncpg://admin:supersecret123@postgres-db:5432/agentedb
+      # Variables para Vertex AI con ADC
+      - GOOGLE_GENAI_USE_VERTEXAI=True
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/config/gcloud-key.json
+      - GOOGLE_CLOUD_PROJECT=${GOOGLE_CLOUD_PROJECT}
+      - GOOGLE_CLOUD_LOCATION=${GOOGLE_CLOUD_LOCATION}
+      # Mantener la API Key como fallback si es necesario
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
     command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
     depends_on:
       postgres-db:

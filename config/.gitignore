@@ -1,0 +1,5 @@
+# Ignorar todas las llaves de servicio de Google Cloud
+*.json
+
+# Permitir archivos de ejemplo
+!example.json

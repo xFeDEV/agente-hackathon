@@ -4,9 +4,12 @@ from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
+from google.genai import types as genai_types
 
 from database import async_engine, AsyncSessionLocal, Base
 from models import QueryLog
+from llm_service import get_gemini_model
+from tool_caller import call_search_web
 
 
 # ========== Esquemas Pydantic ==========
@@ -100,53 +103,111 @@ async def process_query(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    Endpoint principal para procesar consultas del usuario.
+    Endpoint principal para procesar consultas del usuario con agente IA real.
     
     Args:
         request: QueryRequest con user_name y prompt
         db: Sesión de base de datos (inyectada automáticamente)
     
     Returns:
-        QueryResponse con la respuesta final
+        QueryResponse con la respuesta final del agente
     
-    Flujo actual (MVP):
+    Flujo del agente:
         1. Recibe la consulta del usuario
-        2. Genera una respuesta simulada
-        3. Guarda el log en la base de datos
-        4. Devuelve la respuesta
-    
-    Flujo futuro:
-        1. Recibe la consulta del usuario
-        2. Analiza el prompt con el LLM
-        3. Determina qué herramientas invocar
-        4. Ejecuta las herramientas vía n8n
-        5. Construye la respuesta final
-        6. Guarda el log completo
+        2. Envía el prompt a Gemini con herramientas disponibles
+        3. Si Gemini necesita buscar en la web, ejecuta la función
+        4. Envía los resultados de vuelta a Gemini
+        5. Obtiene la respuesta final
+        6. Guarda el log en la base de datos
+        7. Devuelve la respuesta
     """
     try:
-        # ===== LÓGICA MVP: RESPUESTA SIMULADA =====
-        simulated_answer = f"Esta es una respuesta simulada. El prompt fue: {request.prompt}"
+        # Paso 1: Obtener el cliente Gemini configurado
+        result = get_gemini_model()
+        print(f"🔧 Resultado de get_gemini_model: {type(result)}")
+        client, tools = result
+        print(f"🔧 Cliente: {type(client)}, Tools: {type(tools)}")
         
-        # Guardar el log en la base de datos
+        # Paso 2: Primero preguntar a Gemini si necesita buscar información en la web
+        print(f"📤 Analizando prompt: {request.prompt}")
+        analysis_prompt = f"""Analiza la siguiente consulta del usuario y determina si necesitas buscar información actualizada en la web para responderla correctamente.
+
+Consulta del usuario: "{request.prompt}"
+
+Responde ÚNICAMENTE con una de estas dos opciones:
+- Si necesitas buscar en la web (noticias, eventos actuales, información reciente): Responde solo "BUSCAR: <query optimizada para búsqueda>"
+- Si puedes responder con tu conocimiento actual: Responde solo "RESPONDER"
+
+Tu respuesta:"""
+        
+        analysis_response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=analysis_prompt,
+        )
+        
+        analysis_text = analysis_response.text.strip()
+        print(f"🤔 Análisis de Gemini: {analysis_text}")
+        
+        final_answer = None
+        
+        # Paso 3: Verificar si Gemini decidió buscar en la web
+        if analysis_text.startswith("BUSCAR:"):
+            # Gemini decidió usar búsqueda web
+            query = analysis_text.replace("BUSCAR:", "").strip()
+            print(f"🔍 Ejecutando búsqueda web con query: {query}")
+            
+            # Paso 4: Llamar a nuestra herramienta real (webhook n8n)
+            tool_results_dict = await call_search_web(query=query)
+            print(f"✅ Resultados de búsqueda obtenidos")
+            
+            # Paso 5: Enviar los resultados a Gemini para que genere la respuesta final
+            final_prompt = f"""El usuario preguntó: "{request.prompt}"
+
+Encontré esta información actualizada en la web:
+{tool_results_dict}
+
+Por favor, genera una respuesta completa y útil para el usuario basándote en esta información. Sé específico y cita datos relevantes."""
+            
+            print("📤 Enviando resultados a Gemini para generar respuesta final...")
+            final_response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=final_prompt,
+            )
+            
+            final_answer = final_response.text
+            print(f"✅ Respuesta final del agente (con búsqueda web)")
+        else:
+            # Gemini decidió responder directamente
+            print("💬 Generando respuesta directa sin búsqueda web...")
+            direct_response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=request.prompt,
+            )
+            final_answer = direct_response.text
+            print(f"✅ Respuesta directa del agente (sin búsqueda web)")
+        
+        # Paso 7: Guardar el log en la base de datos
         db_log = QueryLog(
             user_name=request.user_name,
             prompt_text=request.prompt,
-            final_answer=simulated_answer
+            final_answer=final_answer
         )
         
         db.add(db_log)
         await db.commit()
-        await db.refresh(db_log)  # Obtener el ID generado
+        await db.refresh(db_log)
         
-        print(f"✅ Log guardado con ID: {db_log.id}")
+        print(f"💾 Log guardado con ID: {db_log.id}")
         
-        # Devolver la respuesta
-        return QueryResponse(final_answer=simulated_answer)
+        # Paso 8: Devolver la respuesta al cliente
+        return QueryResponse(final_answer=final_answer)
     
     except Exception as e:
         # En caso de error, hacer rollback y devolver error
         await db.rollback()
         print(f"❌ Error procesando query: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(
             status_code=500,
             detail=f"Error procesando la consulta: {str(e)}"
